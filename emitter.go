@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -76,24 +77,56 @@ func (e *Emitter) Close() {
 
 var processedCount int64
 
-var sampleAccumulator int64
+const sampleWindowSize = 1000
 
-const sampleFixedPoint = 1000000
+type reservoirSampler struct {
+	rate           float64
+	window         []bool
+	windowIndex    int
+}
 
-func shouldSample(rate float64) bool {
-	if rate >= 1.0 {
+func newReservoirSampler(rate float64) *reservoirSampler {
+	rs := &reservoirSampler{
+		rate:        rate,
+		window:      make([]bool, sampleWindowSize),
+		windowIndex: sampleWindowSize,
+	}
+	return rs
+}
+
+func (rs *reservoirSampler) next() bool {
+	if rs.rate >= 1.0 {
 		return true
 	}
-	if rate <= 0.0 {
+	if rs.rate <= 0.0 {
 		return false
 	}
-	step := int64(rate * sampleFixedPoint)
-	newVal := atomic.AddInt64(&sampleAccumulator, step)
-	if newVal >= sampleFixedPoint {
-		atomic.AddInt64(&sampleAccumulator, -sampleFixedPoint)
-		return true
+	if rs.windowIndex >= sampleWindowSize {
+		rs.refill()
 	}
-	return false
+	result := rs.window[rs.windowIndex]
+	rs.windowIndex++
+	return result
+}
+
+func (rs *reservoirSampler) refill() {
+	k := int(float64(sampleWindowSize) * rs.rate)
+	for i := range rs.window {
+		rs.window[i] = false
+	}
+	for i := 0; i < k; i++ {
+		j := rand.Intn(i + 1)
+		rs.window[i] = true
+		if j != i {
+			rs.window[j] = false
+			rs.window[i] = true
+		}
+	}
+	for i := sampleWindowSize - 1; i > 0; i-- {
+		j := rand.Intn(i + 1)
+		rs.window[i], rs.window[j] = rs.window[j], rs.window[i]
+	}
+	rs.windowIndex = 0
 }
 
 // CopyMulty copies from 1 reader to multiple writers
@@ -103,6 +136,7 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 	filteredRequests := freecache.NewCache(200 * 1024 * 1024) // 200M
 	localSampleRate := Settings.SampleRate
 	localExitAfter := Settings.ExitAfterCount
+	sampler := newReservoirSampler(localSampleRate)
 
 	for {
 		msg, err := src.PluginRead()
@@ -118,19 +152,20 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 		if msg != nil && len(msg.Data) > 0 {
 			if isRequestPayload(msg.Meta) {
 				if localSampleRate < 1.0 {
-					if !shouldSample(localSampleRate) {
+					if !sampler.next() {
 						continue
 					}
 				}
 
 				if localExitAfter >= 0 {
-					newCount := atomic.AddInt64(&processedCount, 1)
-					if newCount > localExitAfter {
+					currentCount := atomic.LoadInt64(&processedCount)
+					if currentCount >= localExitAfter {
 						if Settings.Stats {
 							printFinalStats()
 						}
 						os.Exit(0)
 					}
+					atomic.AddInt64(&processedCount, 1)
 				}
 			}
 

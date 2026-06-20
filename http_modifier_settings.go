@@ -1,6 +1,7 @@
 package goreplay
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"regexp"
@@ -198,10 +199,103 @@ func (h *HTTPMethods) Set(value string) error {
 	return nil
 }
 
+type replaceSegment struct {
+	literal []byte
+	group   int
+	name    string
+}
+
+type replaceTemplate struct {
+	segments []replaceSegment
+}
+
+func parseReplaceTemplate(template []byte) (*replaceTemplate, error) {
+	rt := &replaceTemplate{}
+	var literal []byte
+	i := 0
+	for i < len(template) {
+		if template[i] == '$' && i+1 < len(template) {
+			j := i + 1
+			if template[j] == '$' {
+				literal = append(literal, '$')
+				i += 2
+				continue
+			}
+			if len(literal) > 0 {
+				rt.segments = append(rt.segments, replaceSegment{literal: append([]byte(nil), literal...)})
+				literal = literal[:0]
+			}
+			if template[j] == '{' {
+				end := bytes.IndexByte(template[j+1:], '}')
+				if end < 0 {
+					return nil, fmt.Errorf("unclosed ${ in replacement template")
+				}
+				name := template[j+1 : j+1+end]
+				if len(name) > 0 && name[0] >= '0' && name[0] <= '9' {
+					n, err := strconv.Atoi(string(name))
+					if err != nil {
+						return nil, fmt.Errorf("invalid capture group reference ${%s}: %w", name, err)
+					}
+					rt.segments = append(rt.segments, replaceSegment{group: n})
+				} else {
+					rt.segments = append(rt.segments, replaceSegment{name: string(name)})
+				}
+				i = j + 1 + end + 1
+				continue
+			}
+			numStart := j
+			for j < len(template) && template[j] >= '0' && template[j] <= '9' {
+				j++
+			}
+			if j == numStart {
+				literal = append(literal, '$')
+				i++
+				continue
+			}
+			n, err := strconv.Atoi(string(template[numStart:j]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid capture group reference: %w", err)
+			}
+			rt.segments = append(rt.segments, replaceSegment{group: n})
+			i = j
+			continue
+		}
+		literal = append(literal, template[i])
+		i++
+	}
+	if len(literal) > 0 {
+		rt.segments = append(rt.segments, replaceSegment{literal: append([]byte(nil), literal...)})
+	}
+	return rt, nil
+}
+
+func (rt *replaceTemplate) expand(src []byte, match []int, re *regexp.Regexp) []byte {
+	var result []byte
+	for _, seg := range rt.segments {
+		if seg.literal != nil {
+			result = append(result, seg.literal...)
+			continue
+		}
+		groupIdx := seg.group
+		if seg.name != "" {
+			for i, name := range re.SubexpNames() {
+				if name == seg.name {
+					groupIdx = i
+					break
+				}
+			}
+		}
+		if groupIdx*2+1 < len(match) && match[groupIdx*2] >= 0 {
+			result = append(result, src[match[groupIdx*2]:match[groupIdx*2+1]]...)
+		}
+	}
+	return result
+}
+
 // Handling of --http-rewrite-url option
 type urlRewrite struct {
-	src          *regexp.Regexp
-	replaceBytes []byte
+	src    *regexp.Regexp
+	tmpl   *replaceTemplate
 }
 
 // URLRewriteMap holds regexp and data to modify URL
@@ -235,7 +329,11 @@ func (r *URLRewriteMap) Set(value string) error {
 	if err != nil {
 		return fmt.Errorf("failed to compile regexp %q: %w", pattern, err)
 	}
-	*r = append(*r, urlRewrite{src: re, replaceBytes: []byte(replacement)})
+	tmpl, err := parseReplaceTemplate([]byte(replacement))
+	if err != nil {
+		return fmt.Errorf("failed to parse replacement %q: %w", replacement, err)
+	}
+	*r = append(*r, urlRewrite{src: re, tmpl: tmpl})
 	return nil
 }
 
@@ -243,7 +341,7 @@ func (r *URLRewriteMap) Set(value string) error {
 type headerRewrite struct {
 	header []byte
 	src    *regexp.Regexp
-	target []byte
+	tmpl   *replaceTemplate
 }
 
 // HeaderRewriteMap holds regexp and data to rewrite headers
@@ -267,11 +365,15 @@ func (r *HeaderRewriteMap) Set(value string) error {
 		return errors.New("need both header, regexp and rewrite target, colon-delimited (ex. Header: regexp,target)")
 	}
 
-	regexp, err := regexp.Compile(valArr[0])
+	re, err := regexp.Compile(valArr[0])
 	if err != nil {
 		return err
 	}
-	*r = append(*r, headerRewrite{header: []byte(header), src: regexp, target: []byte(valArr[1])})
+	tmpl, err := parseReplaceTemplate([]byte(valArr[1]))
+	if err != nil {
+		return err
+	}
+	*r = append(*r, headerRewrite{header: []byte(header), src: re, tmpl: tmpl})
 	return nil
 }
 

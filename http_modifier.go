@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"github.com/buger/goreplay/proto"
 	"hash/fnv"
+	"regexp"
 	"strings"
 )
 
@@ -30,6 +31,30 @@ func NewHTTPModifier(config *HTTPModifierConfig) *HTTPModifier {
 	}
 
 	return &HTTPModifier{config: config}
+}
+
+func applyRewrite(src []byte, firstMatch []int, re *regexp.Regexp, tmpl *replaceTemplate) []byte {
+	var buf []byte
+	prevEnd := 0
+	match := firstMatch
+	for len(match) > 0 {
+		buf = append(buf, src[prevEnd:match[0]]...)
+		buf = append(buf, tmpl.expand(src, match, re)...)
+		prevEnd = match[1]
+		if prevEnd >= len(src) {
+			break
+		}
+		match = re.FindSubmatchIndex(src[prevEnd:])
+		if len(match) > 0 {
+			for i := range match {
+				match[i] += prevEnd
+			}
+		}
+	}
+	if prevEnd < len(src) {
+		buf = append(buf, src[prevEnd:]...)
+	}
+	return buf
 }
 
 func (m *HTTPModifier) Rewrite(payload []byte) (response []byte) {
@@ -168,10 +193,13 @@ func (m *HTTPModifier) Rewrite(payload []byte) (response []byte) {
 		path := proto.Path(payload)
 
 		for _, f := range m.config.URLRewrite {
-			if newPath := f.src.ReplaceAll(path, f.replaceBytes); len(newPath) != len(path) || !bytes.Equal(newPath, path) {
-				payload = proto.SetPath(payload, newPath)
-				break
+			match := f.src.FindSubmatchIndex(path)
+			if match == nil {
+				continue
 			}
+			newPath := applyRewrite(path, match, f.src, f.tmpl)
+			payload = proto.SetPath(payload, newPath)
+			break
 		}
 	}
 
@@ -182,9 +210,12 @@ func (m *HTTPModifier) Rewrite(payload []byte) (response []byte) {
 				break
 			}
 
-			if newValue := f.src.ReplaceAll(value, f.target); len(newValue) != len(value) || !bytes.Equal(newValue, value) {
-				payload = proto.SetHeader(payload, f.header, newValue)
+			match := f.src.FindSubmatchIndex(value)
+			if match == nil {
+				continue
 			}
+			newValue := applyRewrite(value, match, f.src, f.tmpl)
+			payload = proto.SetHeader(payload, f.header, newValue)
 		}
 	}
 
