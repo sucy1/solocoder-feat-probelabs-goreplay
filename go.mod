@@ -11,7 +11,7 @@ require (
 	github.com/klauspost/compress v1.16.5 // indirect
 	github.com/mattbaird/elastigo v0.0.0-20170123220020-2fe47fd29e4b
 	github.com/stretchr/testify v1.8.2
-	github.com/xdg-go/scram v1.1.2
+	github.com/xdg-go/scram v1.2.0
 	golang.org/x/net v0.34.0
 	golang.org/x/sys v0.29.0
 	k8s.io/apimachinery v0.27.1
