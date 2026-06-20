@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -31,24 +32,27 @@ type response struct {
 
 // HTTPOutputConfig struct for holding http output configuration
 type HTTPOutputConfig struct {
-	TrackResponses    bool          `json:"output-http-track-response"`
-	Stats             bool          `json:"output-http-stats"`
-	OriginalHost      bool          `json:"output-http-original-host"`
-	RedirectLimit     int           `json:"output-http-redirect-limit"`
-	WorkersMin        int           `json:"output-http-workers-min"`
-	WorkersMax        int           `json:"output-http-workers"`
-	StatsMs           int           `json:"output-http-stats-ms"`
-	QueueLen          int           `json:"output-http-queue-len"`
-	ElasticSearch     string        `json:"output-http-elasticsearch"`
-	Timeout           time.Duration `json:"output-http-timeout"`
-	WorkerTimeout     time.Duration `json:"output-http-worker-timeout"`
-	BufferSize        size.Size     `json:"output-http-response-buffer"`
-	SkipVerify        bool          `json:"output-http-skip-verify"`
-	CompatibilityMode bool          `json:"output-http-compatibility-mode"`
-	RequestGroup      string        `json:"output-http-request-group"`
-	Debug             bool          `json:"output-http-debug"`
-	rawURL            string
-	url               *url.URL
+	TrackResponses     bool          `json:"output-http-track-response"`
+	Stats              bool          `json:"output-http-stats"`
+	OriginalHost       bool          `json:"output-http-original-host"`
+	RedirectLimit      int           `json:"output-http-redirect-limit"`
+	WorkersMin         int           `json:"output-http-workers-min"`
+	WorkersMax         int           `json:"output-http-workers"`
+	StatsMs            int           `json:"output-http-stats-ms"`
+	QueueLen           int           `json:"output-http-queue-len"`
+	ElasticSearch      string        `json:"output-http-elasticsearch"`
+	Timeout            time.Duration `json:"output-http-timeout"`
+	WorkerTimeout      time.Duration `json:"output-http-worker-timeout"`
+	BufferSize         size.Size     `json:"output-http-response-buffer"`
+	SkipVerify         bool          `json:"output-http-skip-verify"`
+	CompatibilityMode  bool          `json:"output-http-compatibility-mode"`
+	RequestGroup       string        `json:"output-http-request-group"`
+	Debug              bool          `json:"output-http-debug"`
+	RateLimit          int           `json:"output-rate-limit"`
+	RateLimitBuffer    int           `json:"output-rate-limit-buffer"`
+	DelayJitter        time.Duration `json:"output-delay-jitter"`
+	rawURL             string
+	url                *url.URL
 }
 
 func (hoc *HTTPOutputConfig) Copy() *HTTPOutputConfig {
@@ -69,6 +73,9 @@ func (hoc *HTTPOutputConfig) Copy() *HTTPOutputConfig {
 		CompatibilityMode: hoc.CompatibilityMode,
 		RequestGroup:      hoc.RequestGroup,
 		Debug:             hoc.Debug,
+		RateLimit:         hoc.RateLimit,
+		RateLimitBuffer:   hoc.RateLimitBuffer,
+		DelayJitter:       hoc.DelayJitter,
 	}
 }
 
@@ -76,16 +83,18 @@ func (hoc *HTTPOutputConfig) Copy() *HTTPOutputConfig {
 // By default workers pool is dynamic and starts with 1 worker or workerMin workers
 // You can specify maximum number of workers using `--output-http-workers`
 type HTTPOutput struct {
-	activeWorkers  int64
-	config         *HTTPOutputConfig
-	queueStats     *GorStat
-	elasticSearch  *ESPlugin
-	client         *HTTPClient
-	stopWorker     chan struct{}
-	queue          chan *Message
-	responses      chan *response
-	stop           chan bool // Channel used only to indicate goroutine should shutdown
-	workerSessions map[string]*httpWorker
+	activeWorkers   int64
+	config          *HTTPOutputConfig
+	queueStats      *GorStat
+	elasticSearch   *ESPlugin
+	client          *HTTPClient
+	stopWorker      chan struct{}
+	queue           chan *Message
+	responses       chan *response
+	stop            chan bool // Channel used only to indicate goroutine should shutdown
+	workerSessions  map[string]*httpWorker
+	rateLimiter     chan struct{}
+	droppedCount    int64
 }
 
 type httpWorker struct {
@@ -162,6 +171,9 @@ func NewHTTPOutput(address string, config *HTTPOutputConfig) PluginReadWriter {
 	if newConfig.WorkerTimeout <= 0 {
 		newConfig.WorkerTimeout = time.Second * 2
 	}
+	if newConfig.RateLimitBuffer <= 0 {
+		newConfig.RateLimitBuffer = 1000
+	}
 	o.config = newConfig
 	o.stop = make(chan bool)
 	if o.config.Stats {
@@ -174,6 +186,11 @@ func NewHTTPOutput(address string, config *HTTPOutputConfig) PluginReadWriter {
 	}
 	// it should not be buffered to avoid races
 	o.stopWorker = make(chan struct{})
+
+	if o.config.RateLimit > 0 {
+		o.rateLimiter = make(chan struct{}, o.config.RateLimitBuffer)
+		go o.startRateLimiter()
+	}
 
 	if o.config.ElasticSearch != "" {
 		o.elasticSearch = new(ESPlugin)
@@ -265,10 +282,94 @@ func (o *HTTPOutput) startWorker() {
 	}
 }
 
+// PluginRead reads message from this plugin
+func (o *HTTPOutput) PluginRead() (*Message, error) {
+	if !o.config.TrackResponses {
+		return nil, ErrorStopped
+	}
+	var resp *response
+	var msg Message
+	select {
+	case <-o.stop:
+		return nil, ErrorStopped
+	case resp = <-o.responses:
+		msg.Data = resp.payload
+	}
+
+	msg.Meta = payloadHeader(ReplayedResponsePayload, resp.uuid, resp.startedAt, resp.roundTripTime)
+
+	return &msg, nil
+}
+
+func (o *HTTPOutput) sendRequest(client *HTTPClient, msg *Message) {
+	if !isRequestPayload(msg.Meta) {
+		return
+	}
+
+	if o.config.DelayJitter > 0 {
+		jitter := time.Duration(rand.Int63n(int64(o.config.DelayJitter)*2)) - o.config.DelayJitter
+		delay := jitter
+		if delay < 0 {
+			delay = 0
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+
+	uuid := payloadID(msg.Meta)
+	start := time.Now()
+	resp, err := client.Send(msg.Data)
+	stop := time.Now()
+
+	if err != nil {
+		Debug(1, fmt.Sprintf("[HTTP-OUTPUT] error when sending: %q", err))
+		return
+	}
+	if resp == nil {
+		return
+	}
+
+	if o.config.TrackResponses {
+		o.responses <- &response{resp, uuid, start.UnixNano(), stop.UnixNano() - start.UnixNano()}
+	}
+
+	if o.elasticSearch != nil {
+		o.elasticSearch.ResponseAnalyze(msg.Data, resp, start, stop)
+	}
+}
+
+func (o *HTTPOutput) startRateLimiter() {
+	ticker := time.NewTicker(time.Second / time.Duration(o.config.RateLimit))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-o.stop:
+			return
+		case <-ticker.C:
+			select {
+			case o.rateLimiter <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
 // PluginWrite writes message to this plugin
 func (o *HTTPOutput) PluginWrite(msg *Message) (n int, err error) {
 	if !isRequestPayload(msg.Meta) {
 		return len(msg.Data), nil
+	}
+
+	if o.config.RateLimit > 0 {
+		select {
+		case <-o.rateLimiter:
+		default:
+			atomic.AddInt64(&o.droppedCount, 1)
+			Debug(1, fmt.Sprintf("[HTTP-OUTPUT] Rate limit exceeded, dropping request. Total dropped: %d", atomic.LoadInt64(&o.droppedCount)))
+			return 0, nil
+		}
 	}
 
 	select {
@@ -302,53 +403,11 @@ func (o *HTTPOutput) PluginWrite(msg *Message) (n int, err error) {
 	return len(msg.Data) + len(msg.Meta), nil
 }
 
-// PluginRead reads message from this plugin
-func (o *HTTPOutput) PluginRead() (*Message, error) {
-	if !o.config.TrackResponses {
-		return nil, ErrorStopped
-	}
-	var resp *response
-	var msg Message
-	select {
-	case <-o.stop:
-		return nil, ErrorStopped
-	case resp = <-o.responses:
-		msg.Data = resp.payload
-	}
-
-	msg.Meta = payloadHeader(ReplayedResponsePayload, resp.uuid, resp.startedAt, resp.roundTripTime)
-
-	return &msg, nil
-}
-
-func (o *HTTPOutput) sendRequest(client *HTTPClient, msg *Message) {
-	if !isRequestPayload(msg.Meta) {
-		return
-	}
-
-	uuid := payloadID(msg.Meta)
-	start := time.Now()
-	resp, err := client.Send(msg.Data)
-	stop := time.Now()
-
-	if err != nil {
-		Debug(1, fmt.Sprintf("[HTTP-OUTPUT] error when sending: %q", err))
-		return
-	}
-	if resp == nil {
-		return
-	}
-
-	if o.config.TrackResponses {
-		o.responses <- &response{resp, uuid, start.UnixNano(), stop.UnixNano() - start.UnixNano()}
-	}
-
-	if o.elasticSearch != nil {
-		o.elasticSearch.ResponseAnalyze(msg.Data, resp, start, stop)
-	}
-}
-
 func (o *HTTPOutput) String() string {
+	dropped := atomic.LoadInt64(&o.droppedCount)
+	if dropped > 0 {
+		return fmt.Sprintf("HTTP output: %s (dropped: %d)", o.config.rawURL, dropped)
+	}
 	return "HTTP output: " + o.config.rawURL
 }
 

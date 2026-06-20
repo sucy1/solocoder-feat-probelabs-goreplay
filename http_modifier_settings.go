@@ -213,15 +213,29 @@ func (r *URLRewriteMap) String() string {
 
 // Set method to implement flags.Value
 func (r *URLRewriteMap) Set(value string) error {
-	valArr := strings.SplitN(value, ":", 2)
-	if len(valArr) < 2 {
-		return errors.New("need both src and target, colon-delimited (ex. /a:/b)")
+	var pattern, replacement string
+
+	if strings.HasPrefix(value, "s/") {
+		parts := strings.SplitN(value[2:], "/", 3)
+		if len(parts) < 3 {
+			return fmt.Errorf("invalid s/pattern/replacement/ format: %q. Expected: s/pattern/replacement/", value)
+		}
+		pattern = parts[0]
+		replacement = parts[1]
+	} else {
+		valArr := strings.SplitN(value, ":", 2)
+		if len(valArr) < 2 {
+			return errors.New("need both src and target, colon-delimited (ex. /a:/b) or s/pattern/replacement/ format")
+		}
+		pattern = valArr[0]
+		replacement = valArr[1]
 	}
-	regexp, err := regexp.Compile(valArr[0])
+
+	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to compile regexp %q: %w", pattern, err)
 	}
-	*r = append(*r, urlRewrite{src: regexp, target: []byte(valArr[1])})
+	*r = append(*r, urlRewrite{src: re, target: []byte(replacement)})
 	return nil
 }
 

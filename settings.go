@@ -62,9 +62,11 @@ func (h *MultiIntOption) Set(value string) error {
 
 // AppSettings is the struct of main configuration
 type AppSettings struct {
-	Verbose   int           `json:"verbose"`
-	Stats     bool          `json:"stats"`
-	ExitAfter time.Duration `json:"exit-after"`
+	Verbose       int           `json:"verbose"`
+	Stats         bool          `json:"stats"`
+	ExitAfter     time.Duration `json:"exit-after-duration"`
+	ExitAfterCount int64        `json:"exit-after"`
+	SampleRate    float64       `json:"sample-rate"`
 
 	SplitOutput          bool   `json:"split-output"`
 	RecognizeTCPSessions bool   `json:"recognize-tcp-sessions"`
@@ -130,11 +132,14 @@ func init() {
 	flag.StringVar(&Settings.Pprof, "http-pprof", "", "Enable profiling. Starts  http server on specified port, exposing special /debug/pprof endpoint. Example: `:8181`")
 	flag.IntVar(&Settings.Verbose, "verbose", 0, "set the level of verbosity, if greater than zero then it will turn on debug output")
 	flag.BoolVar(&Settings.Stats, "stats", false, "Turn on queue stats output")
+	flag.Float64Var(&Settings.SampleRate, "sample-rate", 1.0, "Capture traffic sample rate (0.0-1.0). 0.1 means 10% of requests.")
+	flag.Int64Var(&Settings.ExitAfterCount, "exit-after", 0, "Exit after processing N requests. 0 means no limit.")
 
-	if DEMO == "" {
-		flag.DurationVar(&Settings.ExitAfter, "exit-after", 0, "exit after specified duration")
-	} else {
+	if DEMO != "" {
 		Settings.ExitAfter = 5 * time.Minute
+		Settings.ExitAfterCount = 1000
+	} else {
+		flag.DurationVar(&Settings.ExitAfter, "exit-after-duration", 0, "exit after specified duration")
 	}
 
 	flag.BoolVar(&Settings.SplitOutput, "split-output", false, "By default each output gets same traffic. If set to `true` it splits traffic equally among all outputs.")
@@ -223,6 +228,9 @@ func init() {
 	flag.IntVar(&Settings.OutputHTTPConfig.StatsMs, "output-http-stats-ms", 5000, "Report http output queue stats to console every N milliseconds. default: 5000")
 	flag.BoolVar(&Settings.OutputHTTPConfig.OriginalHost, "http-original-host", false, "Normally gor replaces the Host http header with the host supplied with --output-http.  This option disables that behavior, preserving the original Host header.")
 	flag.StringVar(&Settings.OutputHTTPConfig.ElasticSearch, "output-http-elasticsearch", "", "Send request and response stats to ElasticSearch:\n\tgor --input-raw :8080 --output-http staging.com --output-http-elasticsearch 'es_host:api_port/index_name'")
+	flag.IntVar(&Settings.OutputHTTPConfig.RateLimit, "output-rate-limit", 0, "Limit output to N requests per second. 0 means no limit.")
+	flag.IntVar(&Settings.OutputHTTPConfig.RateLimitBuffer, "output-rate-limit-buffer", 1000, "Maximum number of requests to queue when rate limit is exceeded. Default: 1000")
+	flag.DurationVar(&Settings.OutputHTTPConfig.DelayJitter, "output-delay-jitter", 0, "Add random jitter to request delay (in milliseconds). Actual delay = delay +- random(0, jitter).")
 	/* outputHTTPConfig */
 
 	flag.Var(&MultiOption{&Settings.OutputBinary}, "output-binary", "Forwards incoming binary payloads to given address.\n\t# Redirect all incoming requests to staging.com address \n\tgor --input-raw :80 --input-raw-protocol binary --output-binary staging.com:80")
@@ -279,6 +287,11 @@ func init() {
 
 func CheckSettings() {
 	SettingsHook(&Settings)
+
+	if Settings.SampleRate < 0.0 || Settings.SampleRate > 1.0 {
+		fmt.Fprintf(os.Stderr, "Error: --sample-rate must be between 0.0 and 1.0, got: %f\n", Settings.SampleRate)
+		os.Exit(1)
+	}
 
 	if Settings.OutputFileConfig.SizeLimit < 1 {
 		Settings.OutputFileConfig.SizeLimit.Set("32mb")

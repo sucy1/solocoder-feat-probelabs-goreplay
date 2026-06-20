@@ -6,7 +6,10 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"math/rand"
+	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coocood/freecache"
 )
@@ -72,6 +75,8 @@ func (e *Emitter) Close() {
 	e.plugins.All = nil // avoid Close to make changes again
 }
 
+var processedCount int64
+
 // CopyMulty copies from 1 reader to multiple writers
 func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 	wIndex := 0
@@ -82,11 +87,32 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 		msg, err := src.PluginRead()
 		if err != nil {
 			if err == ErrorStopped || err == io.EOF {
+				if Settings.Stats {
+					printFinalStats()
+				}
 				return nil
 			}
 			return err
 		}
 		if msg != nil && len(msg.Data) > 0 {
+			if isRequestPayload(msg.Meta) {
+				if Settings.SampleRate < 1.0 {
+					if rand.Float64() > Settings.SampleRate {
+						continue
+					}
+				}
+
+				if Settings.ExitAfterCount > 0 {
+					newCount := atomic.AddInt64(&processedCount, 1)
+					if newCount > Settings.ExitAfterCount {
+						if Settings.Stats {
+							printFinalStats()
+						}
+						os.Exit(0)
+					}
+				}
+			}
+
 			if len(msg.Data) > int(Settings.CopyBufferSize) {
 				msg.Data = msg.Data[:Settings.CopyBufferSize]
 			}
@@ -155,5 +181,15 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 				}
 			}
 		}
+	}
+}
+
+func printFinalStats() {
+	count := atomic.LoadInt64(&processedCount)
+	fmt.Fprintf(os.Stderr, "\n=== Final Stats ===\n")
+	fmt.Fprintf(os.Stderr, "Total requests processed: %d\n", count)
+	fmt.Fprintf(os.Stderr, "Sample rate: %f\n", Settings.SampleRate)
+	if Settings.ExitAfterCount > 0 {
+		fmt.Fprintf(os.Stderr, "Exit after: %d requests\n", Settings.ExitAfterCount)
 	}
 }
