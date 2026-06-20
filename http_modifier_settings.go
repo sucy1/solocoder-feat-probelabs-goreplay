@@ -200,8 +200,8 @@ func (h *HTTPMethods) Set(value string) error {
 
 // Handling of --http-rewrite-url option
 type urlRewrite struct {
-	src    *regexp.Regexp
-	target []byte
+	src          *regexp.Regexp
+	replaceBytes []byte
 }
 
 // URLRewriteMap holds regexp and data to modify URL
@@ -235,7 +235,7 @@ func (r *URLRewriteMap) Set(value string) error {
 	if err != nil {
 		return fmt.Errorf("failed to compile regexp %q: %w", pattern, err)
 	}
-	*r = append(*r, urlRewrite{src: re, target: []byte(replacement)})
+	*r = append(*r, urlRewrite{src: re, replaceBytes: []byte(replacement)})
 	return nil
 }
 

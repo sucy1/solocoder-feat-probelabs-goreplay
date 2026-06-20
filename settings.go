@@ -62,11 +62,11 @@ func (h *MultiIntOption) Set(value string) error {
 
 // AppSettings is the struct of main configuration
 type AppSettings struct {
-	Verbose       int           `json:"verbose"`
-	Stats         bool          `json:"stats"`
-	ExitAfter     time.Duration `json:"exit-after-duration"`
-	ExitAfterCount int64        `json:"exit-after"`
-	SampleRate    float64       `json:"sample-rate"`
+	Verbose        int           `json:"verbose"`
+	Stats          bool          `json:"stats"`
+	ExitAfter      time.Duration `json:"exit-after-duration"`
+	ExitAfterCount int64         `json:"exit-after"`
+	SampleRate     float64       `json:"sample-rate"`
 
 	SplitOutput          bool   `json:"split-output"`
 	RecognizeTCPSessions bool   `json:"recognize-tcp-sessions"`
@@ -132,8 +132,9 @@ func init() {
 	flag.StringVar(&Settings.Pprof, "http-pprof", "", "Enable profiling. Starts  http server on specified port, exposing special /debug/pprof endpoint. Example: `:8181`")
 	flag.IntVar(&Settings.Verbose, "verbose", 0, "set the level of verbosity, if greater than zero then it will turn on debug output")
 	flag.BoolVar(&Settings.Stats, "stats", false, "Turn on queue stats output")
+	Settings.ExitAfterCount = -1
 	flag.Float64Var(&Settings.SampleRate, "sample-rate", 1.0, "Capture traffic sample rate (0.0-1.0). 0.1 means 10% of requests.")
-	flag.Int64Var(&Settings.ExitAfterCount, "exit-after", 0, "Exit after processing N requests. 0 means no limit.")
+	flag.Int64Var(&Settings.ExitAfterCount, "exit-after", -1, "Exit after processing N requests. Negative or omitted means no limit.")
 
 	if DEMO != "" {
 		Settings.ExitAfter = 5 * time.Minute

@@ -168,10 +168,8 @@ func (m *HTTPModifier) Rewrite(payload []byte) (response []byte) {
 		path := proto.Path(payload)
 
 		for _, f := range m.config.URLRewrite {
-			if f.src.Match(path) {
-				path = f.src.ReplaceAll(path, f.target)
-				payload = proto.SetPath(payload, path)
-
+			if newPath := f.src.ReplaceAll(path, f.replaceBytes); len(newPath) != len(path) || !bytes.Equal(newPath, path) {
+				payload = proto.SetPath(payload, newPath)
 				break
 			}
 		}
@@ -184,8 +182,7 @@ func (m *HTTPModifier) Rewrite(payload []byte) (response []byte) {
 				break
 			}
 
-			if f.src.Match(value) {
-				newValue := f.src.ReplaceAll(value, f.target)
+			if newValue := f.src.ReplaceAll(value, f.target); len(newValue) != len(value) || !bytes.Equal(newValue, value) {
 				payload = proto.SetHeader(payload, f.header, newValue)
 			}
 		}

@@ -6,7 +6,6 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -77,11 +76,33 @@ func (e *Emitter) Close() {
 
 var processedCount int64
 
+var sampleAccumulator int64
+
+const sampleFixedPoint = 1000000
+
+func shouldSample(rate float64) bool {
+	if rate >= 1.0 {
+		return true
+	}
+	if rate <= 0.0 {
+		return false
+	}
+	step := int64(rate * sampleFixedPoint)
+	newVal := atomic.AddInt64(&sampleAccumulator, step)
+	if newVal >= sampleFixedPoint {
+		atomic.AddInt64(&sampleAccumulator, -sampleFixedPoint)
+		return true
+	}
+	return false
+}
+
 // CopyMulty copies from 1 reader to multiple writers
 func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 	wIndex := 0
 	modifier := NewHTTPModifier(&Settings.ModifierConfig)
 	filteredRequests := freecache.NewCache(200 * 1024 * 1024) // 200M
+	localSampleRate := Settings.SampleRate
+	localExitAfter := Settings.ExitAfterCount
 
 	for {
 		msg, err := src.PluginRead()
@@ -96,15 +117,15 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 		}
 		if msg != nil && len(msg.Data) > 0 {
 			if isRequestPayload(msg.Meta) {
-				if Settings.SampleRate < 1.0 {
-					if rand.Float64() > Settings.SampleRate {
+				if localSampleRate < 1.0 {
+					if !shouldSample(localSampleRate) {
 						continue
 					}
 				}
 
-				if Settings.ExitAfterCount > 0 {
+				if localExitAfter >= 0 {
 					newCount := atomic.AddInt64(&processedCount, 1)
-					if newCount > Settings.ExitAfterCount {
+					if newCount > localExitAfter {
 						if Settings.Stats {
 							printFinalStats()
 						}
@@ -189,7 +210,7 @@ func printFinalStats() {
 	fmt.Fprintf(os.Stderr, "\n=== Final Stats ===\n")
 	fmt.Fprintf(os.Stderr, "Total requests processed: %d\n", count)
 	fmt.Fprintf(os.Stderr, "Sample rate: %f\n", Settings.SampleRate)
-	if Settings.ExitAfterCount > 0 {
+	if Settings.ExitAfterCount >= 0 {
 		fmt.Fprintf(os.Stderr, "Exit after: %d requests\n", Settings.ExitAfterCount)
 	}
 }
