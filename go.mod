@@ -5,7 +5,7 @@ go 1.21
 require (
 	github.com/Shopify/sarama v1.38.1
 	github.com/aws/aws-sdk-go v1.44.262
-	github.com/coocood/freecache v1.2.3
+	github.com/coocood/freecache v1.2.7
 	github.com/google/gopacket v1.1.20-0.20210429153827-3eaba0894325
 	github.com/gorilla/websocket v1.5.0
 	github.com/klauspost/compress v1.16.5 // indirect
